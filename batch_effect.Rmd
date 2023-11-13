@@ -1,0 +1,469 @@
+---
+title: "Batch correction in predictive models"
+author: "Jennifer"
+date: "2023-01-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warnings =FALSE)
+```
+
+
+
+```{r}
+#install.packages("doParallel")
+#devtools::install_github("wdl2459/ConQuR")
+#devtools::install_github("wdl2459/ConQuR", build_vignettes = TRUE, force=TRUE)
+
+
+#load packages
+library(doParallel) 
+library(ConQuR)
+library(randomForest)
+library(dplyr)
+library(caret)
+library(glmnet)
+library(ROCR)
+library(kableExtra)
+
+
+#set working directory
+setwd("~/Desktop/stlp new laptop/Batch effect")
+
+###### Load HIVRC data ######
+load(file="HIV_experiment1.Rdata") 
+taxa = t(Dat_Genus)
+meta = metadat1
+
+# delete gender=2
+index = which(meta$gender == 2)
+taxa = taxa[-index, ]
+meta = meta[-index, ]
+
+meta$Study = factor(meta$Study)
+meta$hivstatus = factor(meta$hivstatus)
+meta$gender = factor(meta$gender)
+meta$race = factor(meta$race)
+
+batch  =  as.numeric(meta$Study) 
+batchN = as.numeric(as.factor(batch))-1
+
+N = apply(taxa, 1, sum) 
+
+age = meta$Age
+bmi = meta$bmi
+gender = meta$gender # factor
+race = meta$race # factor
+hivstatus = meta$hivstatus # factor, key
+logN = log(N)
+batchid = factor(batchN)
+meta$batchid=batchid
+
+
+
+```
+
+## Steps
+
+For each batch in 10 batches:
+
+- Set this batch as the test data and the other 9 batches as the training data
+
+- Use ConQuR to correct the training data –> corrected training tax data
+
+- Train a classifier using the corrected training data, apply the fitted classifier on the corrected training data –> Training AUC
+
+- Use ConQuR to correct the test data [use the corrected training data as the reference batch; do not include outcome variable (which is HIV status in this example) during correction ] –> corrected text tax data
+
+- Apply the classifier on the corrected text data –> Test AUC
+
+
+# With batch correction
+## Random Forest
+```{r}
+summary(batchid)
+record_tab_rf = NULL
+record_auc_rf_test = NULL
+record_auc_rf_train = NULL
+best_ref = NULL
+for (i in 0:8) {
+  set.seed = 1234
+  indx_not_include <- which(meta$batchid == i)
+  batchid_train = batchid[-indx_not_include]
+  age_train = age[-indx_not_include]
+  bmi_train = bmi[-indx_not_include]
+  gender_train = gender[-indx_not_include]
+  hivstatus_train = hivstatus[-indx_not_include]
+  taxa_train = taxa[-indx_not_include, ]
+  
+  age_test = age[indx_not_include]
+  bmi_test = bmi[indx_not_include]
+  gender_test = gender[indx_not_include]
+  hivstatus_test = hivstatus[indx_not_include]
+  taxa_test = taxa[indx_not_include, ]
+  
+  taxa_train_correct_list = list()
+  
+  taxa_test_correct_list = list()
+  
+  record_tab_rf_list = list()
+  
+  record_auc_rf_test[i+1] = 0
+  
+  for (ref in 0:9) {
+    if(ref != i) {
+      taxa_train_correct = ConQuR(tax_tab=taxa_train, batchid=batchid_train,
+                                  covariates=data.frame(age_train, bmi_train,
+                                                        gender_train, hivstatus_train),
+                          batch_ref=as.character(ref)) 
+      taxa_train_correct_list[ref + 1] = list(taxa_train_correct)
+      # Build a random forest classifier using corrected training data
+      temp_train = as.matrix(taxa_train_correct)
+      rownames(temp_train) = NULL
+      colnames(temp_train) = NULL
+      rf_classifier = randomForest(hivstatus_train ~ ., data=temp_train,importance=TRUE)
+      # Apply fitted classifier on training data and evaluate the performance
+      prediction_for_roc_curve_train <- predict(rf_classifier, temp_train, type="prob")
+      pred_train = prediction(prediction_for_roc_curve_train[,2], hivstatus_train)
+      auc.perf_train = performance(pred_train, measure="auc")@y.values[[1]]
+      
+      # Do batch correction on test data, with the corrected training data as the reference batch and do not include the outcome
+      newbatchid = append(rep(1, nrow(taxa_test)), rep(0, nrow(taxa_train)))
+      newbatchid = factor(newbatchid)
+      newtaxa = rbind(taxa_test, taxa_train_correct)
+      
+      age.new = append(age_test, age_train)
+      bmi.new = append(bmi_test, bmi_train)
+      gender.new = append(gender_test, gender_train)
+      
+      taxa_test_correct = ConQuR(tax_tab=newtaxa,batchid=newbatchid,
+                                 covariates= data.frame(age.new, bmi.new, gender.new),
+                              batch_ref="0")
+      
+      taxa_test_correct = taxa_test_correct[1:nrow(taxa_test), ]
+      
+      taxa_test_correct_list[ref + 1] = list(taxa_test_correct)
+      
+      # Apply fitted classifier on test data and evaluate the performance
+      temp_test = as.matrix(taxa_test_correct)
+      rownames(temp_test) = NULL
+      colnames(temp_test) = NULL
+    
+      prediction_for_roc_curve_test <- predict(rf_classifier, temp_test, type="prob")
+      pred_test = prediction(prediction_for_roc_curve_test[,2], hivstatus_test)
+      
+      record_tab_rf_list[ref + 1] = list(data.frame(prob= prediction_for_roc_curve_test[, 2], hivstatus_test))
+    
+      auc.perf_test = performance(pred_test, measure="auc")@y.values[[1]]
+      
+      if (auc.perf_test > record_auc_rf_test[i+1]) {
+        record_auc_rf_test[i + 1] = auc.perf_test
+        best_ref[i + 1] = ref
+        record_auc_rf_train[i + 1] = auc.perf_train
+      }
+    }
+  }
+  
+  # Save corrected train tax data and corrected test taxa data (choosing the best reference batch)
+  write.table(taxa_train_correct_list[[best_ref[i + 1] + 1]], file=paste("/Users/yuxin/Desktop/MS_BIOSTAT//Research/Batch\ correction/V2/", i, "_train_correct_rf.RData", sep=""))
+  
+  write.table(taxa_test_correct_list[[best_ref[i+1] + 1]], file=paste("/Users/yuxin/Desktop/MS_BIOSTAT//Research/Batch\ correction/V2/", i, "_test_correct_rf.RData", sep=""))
+
+  record_tab_rf = rbind(record_tab_rf, record_tab_rf_list[[best_ref[i+1] + 1]])
+}
+
+
+# cannot calculate AUC for batch 9 as test set, return error:
+## Error in .performance.auc(fpr.stop = 1, predictions = c(`1` = 0.844, `2` = 0.93,  : Not enough distinct predictions to compute area under the ROC curve.
+## This batch only has hiv cases
+
+save(record_tab_rf, record_auc_rf_train, record_auc_rf_test, best_ref, file = "hiv_rf.RData")
+```
+
+## Lasso logistic regression
+
+```{r}
+record_tab_lasso = NULL 
+record_auc_lasso_train = NULL
+record_auc_lasso_test = NULL
+best_ref_lasso = NULL
+for (i in 0:8) {
+  set.seed = 1234
+  indx_not_include <- which(meta$batchid == i)
+  batchid_train = batchid[-indx_not_include]
+  age_train = age[-indx_not_include]
+  bmi_train = bmi[-indx_not_include]
+  gender_train = gender[-indx_not_include]
+  hivstatus_train = hivstatus[-indx_not_include]
+  taxa_train = taxa[-indx_not_include, ]
+  
+  age_test = age[indx_not_include]
+  bmi_test = bmi[indx_not_include]
+  gender_test = gender[indx_not_include]
+  hivstatus_test = hivstatus[indx_not_include]
+  taxa_test = taxa[indx_not_include, ]
+  
+  #save(taxa_train_correct, file=paste(i, "_tax_train_correct.RData", sep=""))
+  
+  taxa_train_correct_list = list()
+  
+  taxa_test_correct_list = list()
+  
+  record_tab_lasso_list = list()
+  
+  record_auc_lasso_test[i+1] = 0
+  
+  for (ref in 0:9) {
+    if(ref != i) {
+      taxa_train_correct = ConQuR(tax_tab=taxa_train, batchid=batchid_train, covariates=data.frame(age_train, bmi_train, gender_train, hivstatus_train),
+                            batch_ref=as.character(ref)) 
+      taxa_train_correct_list[ref + 1] = list(taxa_train_correct)
+        # Build a random forest classifier using corrected training data
+      temp_train = as.matrix(taxa_train_correct)
+      rownames(temp_train) = NULL
+      colnames(temp_train) = NULL
+      
+      lasso_classifier = cv.glmnet(x=temp_train, y=hivstatus_train, alpha=1, type.measure='auc', family = "binomial")
+      
+      # Apply fitted classifier on training data and evaluate the performance
+      prediction_for_roc_curve_train <- predict(lasso_classifier, temp_train, type="response", s='lambda.min')
+      pred_train = prediction(prediction_for_roc_curve_train, hivstatus_train)
+      
+      auc.perf_train = performance(pred_train, measure="auc")@y.values[[1]]
+      
+      # Do batch correction on test data, with the corrected training data as the reference batch and do not include the outcome
+      newbatchid = append(rep(1, nrow(taxa_test)), rep(0, nrow(taxa_train)))
+      newbatchid = factor(newbatchid)
+      newtaxa = rbind(taxa_test, taxa_train_correct)
+      
+      age.new = append(age_test, age_train)
+      bmi.new = append(bmi_test, bmi_train)
+      gender.new = append(gender_test, gender_train)
+      
+      taxa_test_correct = ConQuR(tax_tab=newtaxa, batchid=newbatchid, covariates=data.frame(age.new, bmi.new, gender.new),
+                              batch_ref="0")
+      
+      taxa_test_correct = taxa_test_correct[1:nrow(taxa_test), ]
+      
+      taxa_test_correct_list[ref + 1] = list(taxa_test_correct)
+      
+      # Apply fitted classifier on test data and evaluate the performance
+      temp_test = as.matrix(taxa_test_correct)
+      rownames(temp_test) = NULL
+      colnames(temp_test) = NULL
+      
+      
+      prediction_for_roc_curve_test <- predict(lasso_classifier, temp_test, type="response", s='lambda.min')
+      pred_test = prediction(prediction_for_roc_curve_test, hivstatus_test)
+      
+      record_tab_lasso_list[ref + 1] = list(data.frame(prob=prediction_for_roc_curve_test, hivstatus_test))
+    
+      auc.perf_test = performance(pred_test, measure="auc")@y.values[[1]]
+      
+      if (auc.perf_test > record_auc_lasso_test[i+1]) {
+        record_auc_lasso_test[i + 1] = auc.perf_test
+        best_ref_lasso[i + 1] = ref
+        record_auc_lasso_train[i + 1] = auc.perf_train
+      }
+    }
+  }
+  
+  # Save corrected train tax data and corrected test taxa data (choosing the best reference batch)
+  write.table(taxa_train_correct_list[[best_ref_lasso[i + 1] + 1]], file=paste("/Users/yuxin/Desktop/MS_BIOSTAT//Research/Batch\ correction/V2/", i, "_train_correct_lasso.RData", sep=""))
+  
+  write.table(taxa_test_correct_list[[best_ref_lasso[i+1] + 1]], file=paste("/Users/yuxin/Desktop/MS_BIOSTAT//Research/Batch\ correction/V2/", i, "_test_correct_lasso.RData", sep=""))
+
+  record_tab_lasso = rbind(record_tab_lasso, record_tab_lasso_list[[best_ref_lasso[i+1] + 1]])
+}
+
+
+# cannot calculate AUC for batch 9 as test set, return error:
+## Error in .performance.auc(fpr.stop = 1, predictions = c(`1` = 0.844, `2` = 0.93,  : Not enough distinct predictions to compute area under the ROC curve.
+## This batch only has hiv cases
+
+save(record_tab_lasso, record_auc_lasso_train, record_auc_lasso_test, best_ref_lasso, file = "hiv_lasso.RData")
+  
+  
+```
+
+# Without batch correction
+## Random Forest
+
+```{r}
+record_tab_rf_ref = NULL
+record_auc_rf_ref_train = NULL
+record_auc_rf_ref_test = NULL
+for (i in 0:8) {
+  set.seed = 1234
+  indx_not_include <- which(meta$batchid == i)
+  batchid_train = batchid[-indx_not_include]
+  age_train = age[-indx_not_include]
+  bmi_train = bmi[-indx_not_include]
+  gender_train = gender[-indx_not_include]
+  hivstatus_train = hivstatus[-indx_not_include]
+  taxa_train = taxa[-indx_not_include, ]
+  
+  age_test = age[indx_not_include]
+  bmi_test = bmi[indx_not_include]
+  gender_test = gender[indx_not_include]
+  hivstatus_test = hivstatus[indx_not_include]
+  taxa_test = taxa[indx_not_include, ]
+  
+  # Build a random forest classifier using corrected training data
+  temp_train = as.matrix(taxa_train)
+  rownames(temp_train) = NULL
+  colnames(temp_train) = NULL
+  
+  rf_classifier = randomForest(hivstatus_train ~ ., data=temp_train, importance=TRUE)
+  
+  # Apply fitted classifier on training data and evaluate the performance
+  prediction_for_roc_curve_train <- predict(rf_classifier, temp_train, type="prob")
+  pred_train = prediction(prediction_for_roc_curve_train[,2], hivstatus_train)
+  
+  auc.perf_train = performance(pred_train, measure="auc")
+
+  record_auc_rf_ref_train[i+1] = auc.perf_train@y.values[[1]]
+  
+  
+  # Apply fitted classifier on test data and evaluate the performance
+  temp_test = as.matrix(taxa_test)
+  rownames(temp_test) = NULL
+  colnames(temp_test) = NULL
+
+  prediction_for_roc_curve_test <- predict(rf_classifier, temp_test, type="prob")
+  pred_test = prediction(prediction_for_roc_curve_test[,2], hivstatus_test)
+  
+  record_tab_rf_ref = rbind(record_tab_rf_ref, data.frame(prob=prediction_for_roc_curve_test[,2], hivstatus_test))
+
+  auc.perf_test = performance(pred_test, measure="auc")
+
+  record_auc_rf_ref_test[i+1] = auc.perf_test@y.values[[1]]
+}
+
+
+# cannot calculate AUC for batch 9 as test set, return error:
+## Error in .performance.auc(fpr.stop = 1, predictions = c(`1` = 0.844, `2` = 0.92,  : Not enough distinct predictions to compute area under the ROC curve.
+## This batch only has hiv cases
+
+save(record_tab_rf_ref, record_auc_rf_ref_train, record_auc_rf_ref_test, best_ref, file = "hiv_rf_ref.RData")
+
+
+```
+
+## Lasso logistic regression
+```{r}
+
+record_tab_lasso_ref = NULL
+record_auc_lasso_ref_train = NULL
+record_auc_lasso_ref_test = NULL
+for (i in 0:9) {
+  set.seed = 1234
+  indx_not_include <- which(meta$batchid == i)
+  batchid_train = batchid[-indx_not_include]
+  age_train = age[-indx_not_include]
+  bmi_train = bmi[-indx_not_include]
+  gender_train = gender[-indx_not_include]
+  hivstatus_train = hivstatus[-indx_not_include]
+  taxa_train = taxa[-indx_not_include, ]
+  
+  age_test = age[indx_not_include]
+  bmi_test = bmi[indx_not_include]
+  gender_test = gender[indx_not_include]
+  hivstatus_test = hivstatus[indx_not_include]
+  taxa_test = taxa[indx_not_include, ]
+  
+  # Build a random forest classifier using corrected training data
+  temp_train = as.matrix(taxa_train)
+  rownames(temp_train) = NULL
+  colnames(temp_train) = NULL
+  
+  lasso_classifier = cv.glmnet(x=temp_train, y=hivstatus_train, alpha=1, type.measure='auc', family = "binomial")
+  
+  # Apply fitted classifier on training data and evaluate the performance
+  prediction_for_roc_curve_train <- predict(lasso_classifier, temp_train, type="response", s='lambda.min')
+  pred_train = prediction(prediction_for_roc_curve_train, hivstatus_train)
+  
+  auc.perf_train = performance(pred_train, measure="auc")
+
+  record_auc_lasso_ref_train[i+1] = auc.perf_train@y.values[[1]]
+  
+  # Apply fitted classifier on test data and evaluate the performance
+  temp_test = as.matrix(taxa_test)
+  rownames(temp_test) = NULL
+  colnames(temp_test) = NULL
+
+  prediction_for_roc_curve_test <- predict(lasso_classifier, temp_test, type="response", s='lambda.min')
+  pred_test = prediction(prediction_for_roc_curve_test, hivstatus_test)
+  
+  record_tab_lasso_ref = rbind(record_tab_lasso_ref, data.frame(prob=prediction_for_roc_curve_test, hivstatus_test))
+
+  auc.perf_test = performance(pred_test, measure="auc")
+
+  record_auc_lasso_ref_test[i+1] = auc.perf_test@y.values[[1]]
+}
+
+
+# cannot calculate AUC for batch 9 as test set, return error:
+## Error in .performance.auc(fpr.stop = 1, predictions = c(`1` = 0.844, `2` = 0.92,  : Not enough distinct predictions to compute area under the ROC curve.
+## This batch only has hiv cases
+
+save(record_tab_lasso_ref, record_auc_lasso_ref_train, record_auc_lasso_ref_test, file = "hiv_lasso_ref.RData")
+
+```
+
+
+# Results
+
+## Random Forest
+
+```{r}
+
+
+load(file="hiv_rf.RData")
+load(file="hiv_rf_ref.RData")
+# record_auc_rf_train
+# record_auc_rf_test
+record_auc_rf_train[10] = NA
+record_auc_rf_test[10] = NA
+record_auc_rf_ref_train[10] = NA
+record_auc_rf_ref_test[10] = NA
+best_ref[10] = NA
+
+rf_dat <- data.frame(cbind(record_auc_rf_train, record_auc_rf_test, best_ref, record_auc_rf_ref_train, record_auc_rf_ref_test))
+colnames(rf_dat)<-c("Training AUC", "Test AUC", "Chosen Reference Batch", "Training AUC", "Test AUC")
+rownames(rf_dat)<-c("Batch 0", "Batch 1", "Batch 2", "Batch 3", "Batch 4", "Batch 5", "Batch 6", "Batch 7", "Batch 8", "Batch 9")
+kbl(rf_dat) %>%
+  kable_classic() %>%
+  add_header_above(c(" " = 1, "Batch corrected" = 3, "Reference" = 2))
+
+
+```
+
+## Lasso logistic regression
+
+```{r}
+
+load(file="hiv_lasso.RData")
+load(file="hiv_lasso_ref.RData")
+
+record_auc_lasso_train[10] = NA
+record_auc_lasso_test[10] = NA
+record_auc_lasso_ref_train[10] = NA
+record_auc_lasso_ref_test[10] = NA
+best_ref_lasso[10] = NA
+
+lasso_dat <- data.frame(cbind(record_auc_lasso_train, record_auc_lasso_test, best_ref_lasso, record_auc_lasso_ref_train, record_auc_lasso_ref_test))
+colnames(lasso_dat)<-c("Training AUC", "Test AUC", "Chosen Reference Batch", "Training AUC", "Test AUC")
+rownames(lasso_dat)<-c("Batch 0", "Batch 1", "Batch 2", "Batch 3", "Batch 4", "Batch 5", "Batch 6", "Batch 7", "Batch 8", "Batch 9")
+kbl(lasso_dat) %>%
+  kable_classic() %>%
+  add_header_above(c(" " = 1, "Batch corrected" = 3, "Reference" = 2))
+```
+
+
+
+
+
+
+
